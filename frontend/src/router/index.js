@@ -16,7 +16,7 @@ const routes = [
   {
     path: '/section/:id',
     name: 'SectionDetail',
-    component: () => import('@/views/SectionDetailView.vue'),
+    component: () => import('@/views/DiagnosisView.vue'),
     meta: { requiresAuth: true }
   }
 ]

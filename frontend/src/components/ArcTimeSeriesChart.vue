@@ -1,6 +1,14 @@
 <template>
   <div class="arc-time-series-chart-wrapper">
-    <div ref="chartRef" class="arc-time-series-chart" :style="{ height: height + 'px' }"></div>
+    <div
+      ref="chartRef"
+      class="arc-time-series-chart"
+      :style="{ height: height + 'px', cursor: readOnly ? 'default' : 'crosshair' }"
+      @mousedown="onMouseDown"
+      @mousemove="onMouseMove"
+      @mouseup="onMouseUp"
+      @mouseleave="onMouseLeave"
+    ></div>
     <div v-if="!connected" class="reconnect-badge">RECONNECTING</div>
     <div v-if="loading" class="loading-overlay">
       <div class="loading-spinner"></div>
@@ -9,7 +17,7 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, watch, onMounted, onUnmounted, nextTick, shallowRef } from 'vue'
 import * as echarts from 'echarts'
 import { lttb, createStreamingLttb } from '@/utils/downsampling'
 import { useDataQuery } from '@/composables/useDataQuery'
@@ -58,10 +66,26 @@ const props = defineProps({
   queryFn: {
     type: Function,
     default: null
+  },
+  cursorTime: {
+    type: Number,
+    default: null
+  },
+  highlightRanges: {
+    type: Array,
+    default: () => []
+  },
+  markers: {
+    type: Array,
+    default: () => []
+  },
+  readOnly: {
+    type: Boolean,
+    default: false
   }
 })
 
-const emit = defineEmits(['data-point-click', 'range-change'])
+const emit = defineEmits(['data-point-click', 'range-change', 'cursor-change', 'range-select'])
 
 const chartRef = ref(null)
 let chartInstance = null
@@ -78,6 +102,11 @@ let flushCounter = 0
 const DOWNSAMPLE_EVERY_N_FLUSHES = 10
 
 let streamingLttb = null
+
+const cursorUpdateLock = shallowRef(false)
+const isRangeSelecting = ref(false)
+const rangeStartX = ref(null)
+const rangeEndX = ref(null)
 
 const { data: queryData, loading, query, refetch } = useDataQuery(
   async (params, signal) => {
@@ -182,26 +211,112 @@ function appendChartData(points) {
   })
 }
 
-function updateChartFull() {
-  if (!chartInstance) return
+function buildMarkArea() {
+  if (!props.highlightRanges || props.highlightRanges.length === 0) return []
 
-  chartInstance.setOption({
-    series: [{
-      data: displayData.value
-    }]
-  }, {
-    notMerge: false,
-    lazyUpdate: true,
-    silent: true
-  })
+  return props.highlightRanges.map(range => [
+    {
+      xAxis: range.start,
+      itemStyle: {
+        color: hexToRgba(range.color || '#f56c6c', 0.12)
+      },
+      label: range.label ? {
+        show: true,
+        formatter: range.label,
+        position: 'top',
+        color: range.color || '#f56c6c',
+        fontSize: 10,
+        backgroundColor: 'rgba(20,23,40,0.8)',
+        padding: [2, 6]
+      } : { show: false }
+    },
+    {
+      xAxis: range.end
+    }
+  ])
 }
 
-function initChart() {
-  if (!chartRef.value) return
+function buildMarkLines() {
+  const lines = [
+    {
+      yAxis: props.warningThreshold,
+      lineStyle: { color: '#e6a23c', type: 'dashed', width: 1.5 },
+      label: {
+        formatter: '预警线 ' + props.warningThreshold + 'W',
+        color: '#e6a23c',
+        fontSize: 11,
+        position: 'insideEndTop'
+      }
+    },
+    {
+      yAxis: props.alarmThreshold,
+      lineStyle: { color: '#f56c6c', type: 'dashed', width: 1.5 },
+      label: {
+        formatter: '报警线 ' + props.alarmThreshold + 'W',
+        color: '#f56c6c',
+        fontSize: 11,
+        position: 'insideEndTop'
+      }
+    }
+  ]
 
-  chartInstance = echarts.init(chartRef.value, 'dark')
+  if (props.markers && props.markers.length > 0) {
+    props.markers.forEach(marker => {
+      lines.push({
+        xAxis: marker.timestamp,
+        lineStyle: { color: marker.color || '#409eff', type: 'solid', width: 1.5 },
+        label: { show: false }
+      })
+    })
+  }
 
-  chartInstance.setOption({
+  return lines
+}
+
+function buildCursorMarkLine() {
+  if (props.cursorTime === null || props.cursorTime === undefined) return []
+
+  const rawPoint = findRawPoint(props.cursorTime)
+  const intensity = rawPoint ? rawPoint.intensity : null
+  const timeStr = formatTimestamp(props.cursorTime)
+  const valueStr = intensity !== null ? `${intensity.toFixed(3)} W` : '--'
+
+  return [{
+    xAxis: props.cursorTime,
+    lineStyle: { color: '#409eff', type: 'solid', width: 1 },
+    label: {
+      show: true,
+      position: 'top',
+      formatter: `${timeStr} | ${valueStr}`,
+      color: '#ffffff',
+      fontSize: 11,
+      fontWeight: 600,
+      backgroundColor: 'rgba(64,158,255,0.9)',
+      padding: [3, 8],
+      borderRadius: 3
+    }
+  }]
+}
+
+function hexToRgba(hex, alpha) {
+  const h = hex.replace('#', '')
+  const r = parseInt(h.substring(0, 2), 16)
+  const g = parseInt(h.substring(2, 4), 16)
+  const b = parseInt(h.substring(4, 6), 16)
+  return `rgba(${r},${g},${b},${alpha})`
+}
+
+function formatTimestamp(ts) {
+  const d = new Date(ts)
+  const hh = d.getHours().toString().padStart(2, '0')
+  const mm = d.getMinutes().toString().padStart(2, '0')
+  const ss = d.getSeconds().toString().padStart(2, '0')
+  const ms = d.getMilliseconds().toString().padStart(3, '0')
+  return `${hh}:${mm}:${ss}.${ms}`
+}
+
+function getBaseChartOption() {
+  return {
     backgroundColor: 'transparent',
     animation: false,
     title: {
@@ -218,6 +333,7 @@ function initChart() {
       textStyle: { color: '#e0e3eb', fontSize: 12 },
       animation: false,
       transitionDuration: 0,
+      alwaysShowContent: false,
       formatter(params) {
         const p = params[0]
         if (!p) return ''
@@ -301,36 +417,43 @@ function initChart() {
         emphasis: {
           disabled: true
         },
+        markArea: {
+          silent: true,
+          data: buildMarkArea()
+        },
         markLine: {
           silent: true,
           symbol: 'none',
           animation: false,
-          data: [
-            {
-              yAxis: props.warningThreshold,
-              lineStyle: { color: '#e6a23c', type: 'dashed', width: 1.5 },
-              label: {
-                formatter: '预警线 ' + props.warningThreshold + 'W',
-                color: '#e6a23c',
-                fontSize: 11,
-                position: 'insideEndTop'
-              }
-            },
-            {
-              yAxis: props.alarmThreshold,
-              lineStyle: { color: '#f56c6c', type: 'dashed', width: 1.5 },
-              label: {
-                formatter: '报警线 ' + props.alarmThreshold + 'W',
-                color: '#f56c6c',
-                fontSize: 11,
-                position: 'insideEndTop'
-              }
-            }
-          ]
+          data: buildMarkLines().concat(buildCursorMarkLine())
         }
       }
     ]
-  }, true)
+  }
+}
+
+function updateChartFull() {
+  if (!chartInstance) return
+
+  chartInstance.setOption({
+    series: [{
+      data: displayData.value,
+      markArea: { data: buildMarkArea() },
+      markLine: { data: buildMarkLines().concat(buildCursorMarkLine()) }
+    }]
+  }, {
+    notMerge: false,
+    lazyUpdate: true,
+    silent: true
+  })
+}
+
+function initChart() {
+  if (!chartRef.value) return
+
+  chartInstance = echarts.init(chartRef.value, 'dark')
+
+  chartInstance.setOption(getBaseChartOption(), true)
 
   chartInstance.on('click', (params) => {
     if (params.componentType === 'series') {
@@ -376,6 +499,197 @@ function handleResize() {
   chartInstance?.resize()
 }
 
+function getTimestampFromEvent(event) {
+  if (!chartInstance || !chartRef.value) return null
+
+  const rect = chartRef.value.getBoundingClientRect()
+  const x = event.clientX - rect.left
+  const pointInGrid = chartInstance.convertFromPixel({ gridIndex: 0, xAxisIndex: 0 }, [x, 0])
+  if (!pointInGrid || pointInGrid[0] === undefined) return null
+  return pointInGrid[0]
+}
+
+function dispatchCursorTooltip(timestamp) {
+  if (!chartInstance) return
+  const allData = chartRenderData
+  if (!allData || allData.length === 0) return
+
+  let closestIdx = 0
+  let minDiff = Infinity
+  for (let i = 0; i < allData.length; i++) {
+    const diff = Math.abs(allData[i][0] - timestamp)
+    if (diff < minDiff) {
+      minDiff = diff
+      closestIdx = i
+    }
+  }
+
+  try {
+    chartInstance.dispatchAction({
+      type: 'showTip',
+      seriesIndex: 0,
+      dataIndex: closestIdx
+    })
+  } catch (e) {}
+}
+
+function hideCursorTooltip() {
+  if (!chartInstance) return
+  try {
+    chartInstance.dispatchAction({
+      type: 'hideTip'
+    })
+  } catch (e) {}
+}
+
+function updateCursorMarkLine(timestamp) {
+  if (!chartInstance) return
+
+  const allLines = buildMarkLines()
+  if (timestamp !== null && timestamp !== undefined) {
+    const rawPoint = findRawPoint(timestamp)
+    const intensity = rawPoint ? rawPoint.intensity : null
+    const timeStr = formatTimestamp(timestamp)
+    const valueStr = intensity !== null ? `${intensity.toFixed(3)} W` : '--'
+
+    allLines.push({
+      xAxis: timestamp,
+      lineStyle: { color: '#409eff', type: 'solid', width: 1 },
+      label: {
+        show: true,
+        position: 'top',
+        formatter: `${timeStr} | ${valueStr}`,
+        color: '#ffffff',
+        fontSize: 11,
+        fontWeight: 600,
+        backgroundColor: 'rgba(64,158,255,0.9)',
+        padding: [3, 8],
+        borderRadius: 3
+      }
+    })
+  }
+
+  chartInstance.setOption({
+    series: [{
+      markLine: { data: allLines }
+    }]
+  }, { notMerge: false, lazyUpdate: true, silent: true })
+}
+
+function onMouseDown(event) {
+  if (props.readOnly) return
+
+  const timestamp = getTimestampFromEvent(event)
+  if (timestamp === null) return
+
+  isRangeSelecting.value = false
+  rangeStartX.value = timestamp
+  rangeEndX.value = null
+
+  window._chartMouseDownTs = Date.now()
+}
+
+function onMouseMove(event) {
+  if (props.readOnly) return
+  if (rangeStartX.value === null) return
+
+  const timestamp = getTimestampFromEvent(event)
+  if (timestamp === null) return
+
+  const elapsed = Date.now() - (window._chartMouseDownTs || 0)
+  const diff = Math.abs(timestamp - rangeStartX.value)
+
+  if (elapsed > 150 || diff > 500) {
+    isRangeSelecting.value = true
+  }
+
+  if (isRangeSelecting.value) {
+    rangeEndX.value = timestamp
+  } else {
+    emitCursorChange(timestamp, true)
+  }
+}
+
+function onMouseUp(event) {
+  if (props.readOnly) return
+
+  const timestamp = getTimestampFromEvent(event)
+
+  if (isRangeSelecting.value && rangeStartX.value !== null && rangeEndX.value !== null) {
+    const start = Math.min(rangeStartX.value, rangeEndX.value)
+    const end = Math.max(rangeStartX.value, rangeEndX.value)
+    if (Math.abs(end - start) > 500) {
+      emit('range-select', { start, end })
+    } else {
+      if (timestamp !== null) {
+        emitCursorChange(timestamp, true)
+      }
+    }
+  } else if (rangeStartX.value !== null) {
+    if (timestamp !== null) {
+      emitCursorChange(timestamp, true)
+    }
+  }
+
+  isRangeSelecting.value = false
+  rangeStartX.value = null
+  rangeEndX.value = null
+  window._chartMouseDownTs = null
+}
+
+function onMouseLeave() {
+  isRangeSelecting.value = false
+  rangeStartX.value = null
+  rangeEndX.value = null
+  window._chartMouseDownTs = null
+}
+
+function emitCursorChange(timestamp, fromUser) {
+  const rawPoint = findRawPoint(timestamp)
+  const value = rawPoint ? rawPoint.intensity : null
+  emit('cursor-change', { timestamp, value, fromUser })
+}
+
+watch(() => props.cursorTime, (newTs) => {
+  if (cursorUpdateLock.value) return
+  cursorUpdateLock.value = true
+
+  try {
+    if (newTs !== null && newTs !== undefined) {
+      updateCursorMarkLine(newTs)
+      dispatchCursorTooltip(newTs)
+      const rawPoint = findRawPoint(newTs)
+      const value = rawPoint ? rawPoint.intensity : null
+      emit('cursor-change', { timestamp: newTs, value, fromUser: false })
+    } else {
+      updateCursorMarkLine(null)
+      hideCursorTooltip()
+    }
+  } finally {
+    nextTick(() => {
+      cursorUpdateLock.value = false
+    })
+  }
+}, { immediate: false })
+
+watch(() => props.highlightRanges, () => {
+  if (!chartInstance) return
+  chartInstance.setOption({
+    series: [{
+      markArea: { data: buildMarkArea() }
+    }]
+  }, { notMerge: false, lazyUpdate: true, silent: true })
+}, { deep: true })
+
+watch(() => props.markers, () => {
+  if (!chartInstance) return
+  chartInstance.setOption({
+    series: [{
+      markLine: { data: buildMarkLines().concat(buildCursorMarkLine()) }
+    }]
+  }, { notMerge: false, lazyUpdate: true, silent: true })
+}, { deep: true })
+
 watch(() => props.data, (newData) => {
   if (!newData || newData.length === 0) return
 
@@ -420,30 +734,7 @@ watch(() => props.warningThreshold, () => {
   if (!chartInstance) return
   chartInstance.setOption({
     series: [{
-      markLine: {
-        data: [
-          {
-            yAxis: props.warningThreshold,
-            lineStyle: { color: '#e6a23c', type: 'dashed', width: 1.5 },
-            label: {
-              formatter: '预警线 ' + props.warningThreshold + 'W',
-              color: '#e6a23c',
-              fontSize: 11,
-              position: 'insideEndTop'
-            }
-          },
-          {
-            yAxis: props.alarmThreshold,
-            lineStyle: { color: '#f56c6c', type: 'dashed', width: 1.5 },
-            label: {
-              formatter: '报警线 ' + props.alarmThreshold + 'W',
-              color: '#f56c6c',
-              fontSize: 11,
-              position: 'insideEndTop'
-            }
-          }
-        ]
-      }
+      markLine: { data: buildMarkLines().concat(buildCursorMarkLine()) }
     }]
   }, { notMerge: false, lazyUpdate: true })
 })
@@ -452,30 +743,7 @@ watch(() => props.alarmThreshold, () => {
   if (!chartInstance) return
   chartInstance.setOption({
     series: [{
-      markLine: {
-        data: [
-          {
-            yAxis: props.warningThreshold,
-            lineStyle: { color: '#e6a23c', type: 'dashed', width: 1.5 },
-            label: {
-              formatter: '预警线 ' + props.warningThreshold + 'W',
-              color: '#e6a23c',
-              fontSize: 11,
-              position: 'insideEndTop'
-            }
-          },
-          {
-            yAxis: props.alarmThreshold,
-            lineStyle: { color: '#f56c6c', type: 'dashed', width: 1.5 },
-            label: {
-              formatter: '报警线 ' + props.alarmThreshold + 'W',
-              color: '#f56c6c',
-              fontSize: 11,
-              position: 'insideEndTop'
-            }
-          }
-        ]
-      }
+      markLine: { data: buildMarkLines().concat(buildCursorMarkLine()) }
     }]
   }, { notMerge: false, lazyUpdate: true })
 })
@@ -546,6 +814,7 @@ onUnmounted(() => {
   position: relative;
   width: 100%;
   min-height: 200px;
+  user-select: none;
 }
 
 .arc-time-series-chart {
