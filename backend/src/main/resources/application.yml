@@ -1,0 +1,47 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: catenary-arc-monitor
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      batch-size: 32768
+      buffer-memory: 67108864
+      linger-ms: 5
+      compression-type: lz4
+    consumer:
+      group-id: arc-monitor-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      max-poll-records: 500
+      fetch-min-size: 1024
+    topics:
+      arc-data: arc-intensity-data
+
+influxdb:
+  url: http://localhost:8086
+  token: my-super-secret-admin-token
+  org: catenary-monitor
+  bucket: arc-data
+  retention-policy: 30d
+
+jwt:
+  secret: Y2F0ZW5hcnktYXJjLW1vbml0b3Itand0LXNlY3JldC1rZXktMjAyNA==
+  expiration: 86400000
+  header: Authorization
+  prefix: "Bearer "
+
+monitor:
+  downsampling:
+    default-interval: 1s
+    max-points-per-response: 2000
+    algorithm: lttb
+  alert:
+    intensity-threshold: 80.0
+    duration-threshold-ms: 500
