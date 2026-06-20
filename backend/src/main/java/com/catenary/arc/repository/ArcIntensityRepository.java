@@ -122,6 +122,54 @@ public class ArcIntensityRepository {
                 .addField("temperature", arc.getTemperature());
     }
 
+    public List<ArcDataPoint> queryAdaptiveDownsampled(String sectionId, Instant start, Instant end, int targetPoints) {
+        long timeRangeMs = end.toEpochMilli() - start.toEpochMilli();
+        long intervalMs = Math.max(1, timeRangeMs / targetPoints);
+        String interval = intervalMs + "ms";
+
+        String flux = String.format(
+                "from(bucket: \"%s\")" +
+                "  |> range(start: %s, stop: %s)" +
+                "  |> filter(fn: (r) => r._measurement == \"arc_intensity\")" +
+                "  |> filter(fn: (r) => r.sectionId == \"%s\")" +
+                "  |> filter(fn: (r) => r._field == \"intensity\")" +
+                "  |> aggregateWindow(every: %s, fn: mean, createEmpty: false)" +
+                "  |> limit(n: %d)",
+                bucket, start.toString(), end.toString(), sectionId, interval, targetPoints);
+
+        log.debug("Executing adaptive downsampled query for sectionId={} interval={} targetPoints={}", sectionId, interval, targetPoints);
+        List<FluxTable> tables = influxDBClient.getQueryApi().query(flux);
+        return tables.stream()
+                .flatMap(table -> table.getRecords().stream())
+                .map(record -> ArcDataPoint.builder()
+                        .time(record.getTime())
+                        .intensity(((Number) record.getValue()).doubleValue())
+                        .build())
+                .collect(Collectors.toList());
+    }
+
+    public long queryEstimatedPointCount(String sectionId, Instant start, Instant end) {
+        String flux = String.format(
+                "from(bucket: \"%s\")" +
+                "  |> range(start: %s, stop: %s)" +
+                "  |> filter(fn: (r) => r._measurement == \"arc_intensity\")" +
+                "  |> filter(fn: (r) => r.sectionId == \"%s\")" +
+                "  |> filter(fn: (r) => r._field == \"intensity\")" +
+                "  |> count()",
+                bucket, start.toString(), end.toString(), sectionId);
+
+        log.debug("Executing point count query for sectionId={} range={} to {}", sectionId, start, end);
+        List<FluxTable> tables = influxDBClient.getQueryApi().query(flux);
+        if (tables.isEmpty() || tables.get(0).getRecords().isEmpty()) {
+            return 0;
+        }
+        Object value = tables.get(0).getRecords().get(0).getValue();
+        if (value instanceof Number) {
+            return ((Number) value).longValue();
+        }
+        return 0;
+    }
+
     private double extractScalarValue(List<FluxTable> tables) {
         if (tables.isEmpty() || tables.get(0).getRecords().isEmpty()) {
             return 0.0;
